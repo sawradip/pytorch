@@ -315,6 +315,13 @@ struct Environment {
     type_table[name] = std::move(type);
   }
 
+  c10::optional<TypePtr> getType(const std::string& name) {
+    if (type_table.find(name) != type_table.end()) {
+      return type_table[name];
+    }
+    return c10::nullopt;
+  }
+
   SugaredValuePtr findInAnyFrame(const std::string& name) {
     for (auto runner = this; runner; runner = runner->next.get()) {
       if (auto r = runner->findInThisFrame(name)) {
@@ -1165,10 +1172,10 @@ struct to_ir {
       return {};
     }
     // statement must be var {is, is not} None
-    auto name = Var(lhs).name().name();
-    // XXX - while it should in theory be possible to specialize
-    // the `x is None` to know x has type NoneType, we have previously not
-    // done this. Unfortunately, doing this will make the type None
+    const std::string& name = Var(lhs).name().name();
+    // While it should in theory be possible to specialize
+    // the `x is None` to know x has type NoneType, we have previously
+    // not done this. Unfortunately, doing this will make the type None
     // propagate further in all loaded models. The handling of
     // unwrap_optional will fail in these cases since export did
     // not expect that the input would be none and an unannotated None.
@@ -1177,12 +1184,26 @@ struct to_ir {
     // and (2) only enable this OPTIONAL_NONE when loading newer
     // graphs because it is incompatible with older graphs.
     // Refinement none(name, RefinementKind::OPTIONAL_NONE);
-    if (auto optional_type = lhs_value->type()->cast<OptionalType>()) {
+    if (const auto optional_type = lhs_value->type()->cast<OptionalType>()) {
       Refinement present(name, optional_type->getElementType());
       if (tok == TK_IS) {
         return RefinementSet({}, {present});
       } else { // TK_ISNOT
         return RefinementSet({present}, {});
+      }
+    }
+    if (const auto union_type = lhs_value->type()->cast<UnionType>()) {
+      std::vector<TypePtr> to_subtract{NoneType::get()};
+      c10::optional<TypePtr> remaining =
+          union_type->subtractTypeSet(to_subtract);
+      std::vector<Refinement> present{};
+      if (remaining) {
+        present.push_back({name, *remaining});
+      }
+      if (tok == TK_IS) {
+        return RefinementSet({}, present);
+      } else { // TK_ISNOT
+        return RefinementSet(present, {});
       }
     }
     return RefinementSet();
@@ -1627,7 +1648,6 @@ struct to_ir {
 
     // Register outputs in each block
     for (const auto& x : mutated_variables) {
-      // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
       Value* tv;
       // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
       Value* fv;
@@ -1662,7 +1682,31 @@ struct to_ir {
         graph->createStore(x, fv)->insertBefore(false_block->return_node());
       }
 
-      auto unified = unifyTypes(tv->type(), fv->type());
+      // If we already know that the type is a Union, then we want to
+      // allow heterogeneous types to be unified
+      c10::optional<TypePtr> full_type = environment_stack->getType(x);
+      bool default_to_union =
+          full_type && (*full_type)->kind() == UnionType::Kind;
+      auto unified = unifyTypes(
+          tv->type(), fv->type(), /*default_to_union=*/default_to_union);
+
+      // Special logic for if we have a Union-typed value: check if
+      // the Union we got from unifying the `true` and `false` types
+      // is a subtype of the known type of the value. If so, set
+      // `unified` to be the known type to prevent unintentional
+      // narrowing of the Union type. E.g. `Union[T1, T2, T3]` should
+      // not become `Union[T1, T2]` just because its initial definition
+      // is as "`T1` if cond else `T2`". If the Union we got from type
+      // unification is not a subtype of the known Union type, set
+      // `unified` to `nullptr` to trigger the error-reporting logic
+      // below
+      if (default_to_union) {
+        if ((*unified)->isSubtypeOf(*full_type)) {
+          unified = full_type;
+        } else {
+          unified = nullptr;
+        }
+      }
 
       // attempt to unify the types. we allow variables to be set to different
       // types in each branch as long as that variable is not already in scope,
@@ -1706,84 +1750,181 @@ struct to_ir {
   }
 
   CondValue emitIsInstance(const Expr& obj, const Expr& classinfo) {
-    // turn (float, (int, tuple)) into a flat list of types and type kind
-    // category checks: tuple_check = true, types = {float, int}
-    struct GatheredTypes {
-      GatheredTypes(ScriptTypeParser parser) : typeParser_(std::move(parser)) {}
-      void gather(const Expr& classinfo) {
-        if (classinfo.kind() == TK_TUPLE_LITERAL) {
-          for (Expr e : TupleLiteral(classinfo).inputs()) {
-            gather(e);
+    // For use with `unifyTypeList`
+    std::stringstream nowhere;
+
+    Value* lhs_val;
+
+    // Get the types on the right-hand side of the `isinstance`
+    // expression, e.g. `isinstance(x, (float, int))` -> `{float, int}.
+    // While doing this, we also want to decompose any `Union` types,
+    // namely `Union`, `Optional`, and `Number`
+    // NB: We can't use `auto` with this lambda because it contains a
+    // recursive call
+    std::function<void(const Expr&, std::vector<TypePtr>&, bool)> gather_types;
+
+    gather_types =
+        [&](const Expr& expr, std::vector<TypePtr>& types, bool is_lhs) {
+          TypePtr t;
+
+          if (!is_lhs) {
+            if (expr.kind() == TK_TUPLE_LITERAL) {
+              for (Expr e : TupleLiteral(expr).inputs()) {
+                gather_types(e, types, is_lhs);
+              }
+              return;
+            }
+            t = typeParser_.parseTypeFromExpr(expr);
+          } else {
+            lhs_val = emitExpr(expr);
+            t = lhs_val->type();
           }
-          return;
-        }
-        TypePtr type = typeParser_.parseTypeFromExpr(classinfo);
-        types.emplace_back(type);
-      }
-      bool staticallyTrue(const TypePtr& actual_type) {
-        // is this isinstance check statically true?
-        for (const TypePtr& typ : types) {
-          if (actual_type->isSubtypeOf(typ)) {
-            return true;
+
+          if (t->kind() == UnionType::Kind) {
+            auto inner = t->expect<UnionType>()->containedTypes().vec();
+            types.insert(types.end(), inner.begin(), inner.end());
+          } else if (t->kind() == OptionalType::Kind) {
+            auto inner = t->expect<OptionalType>()->getElementType();
+            types.push_back(inner);
+            types.push_back(NoneType::get());
+          } else if (t->kind() == NumberType::Kind) {
+            types.push_back(IntType::get());
+            types.push_back(FloatType::get());
+            types.push_back(ComplexType::get());
+          } else {
+            types.push_back(t);
           }
-        }
-        return false;
-      }
-      bool maybeOfKind(TypeKind kind, const TypePtr& actual_type) {
-        if (actual_type->kind() == AnyType::Kind) {
-          return true;
-        }
-        if (const auto optional_type = actual_type->cast<OptionalType>()) {
-          return optional_type->getElementType()->kind() == kind;
-        }
-        if (const auto union_type = actual_type->cast<UnionType>()) {
-          return std::any_of(
-              union_type->containedTypes().begin(),
-              union_type->containedTypes().end(),
-              [&](const TypePtr contained) {
-                return contained->kind() == kind;
-              });
-        }
-        return false;
-      }
-      bool staticallyFalse(const TypePtr& actual_type) {
-        for (const TypePtr& typ : types) {
-          if (typ->isSubtypeOf(actual_type)) {
-            return false;
-          }
-          if ((typ->isSubtypeOf(AnyListType::get()) &&
-               maybeOfKind(ListType::Kind, actual_type)) ||
-              (typ->isSubtypeOf(AnyTupleType::get()) &&
-               maybeOfKind(TupleType::Kind, actual_type))) {
-            return false;
-          }
-        }
-        return true;
-      }
-      ScriptTypeParser typeParser_;
-      std::vector<TypePtr> types;
+        };
+
+    auto dedup = [&](std::vector<TypePtr>& types) {
+      std::sort(
+          types.begin(),
+          types.end(),
+          [&](const TypePtr& t1, const TypePtr& t2) {
+            if (t1->kind() != t1->kind()) {
+              return t1->kind() < t2->kind();
+            }
+            return t1->str() < t2->str();
+          });
+
+      auto new_end = std::unique(
+          types.begin(),
+          types.end(),
+          [&](const TypePtr& t1, const TypePtr& t2) { return *t1 == *t2; });
+
+      types.erase(new_end, types.end());
     };
-    GatheredTypes gathered(typeParser_);
-    gathered.gather(classinfo);
-    auto val = emitExpr(obj);
+
+    std::vector<TypePtr> lhs_types;
+    std::vector<TypePtr> rhs_types;
+
+    gather_types(obj, lhs_types, /*is_lhs=*/true);
+    gather_types(classinfo, rhs_types, /*is_lhs=*/false);
+
     RefinementSet refinement;
-    if (gathered.types.size() == 1 &&
-        gathered.types.at(0)->isSubtypeOf(val->type()) &&
-        obj.kind() == TK_VAR) {
+
+    TypePtr unified_true = nullptr;
+    TypePtr unified_false = nullptr;
+
+    if (obj.kind() == TK_VAR) {
       std::string ident = Var(obj).name().name();
-      Refinement isinstance(std::move(ident), gathered.types.at(0));
-      refinement = RefinementSet({isinstance}, {});
+
+      std::vector<Refinement> true_refinements;
+      std::vector<Refinement> false_refinements;
+
+      std::vector<TypePtr> isinstance_types;
+      std::vector<TypePtr> not_isinstance_types;
+
+      // We can discard any rhs types that we know statically would be
+      // impossible. For example, if we had:
+      //
+      //    def fn(x: Optional[str]):
+      //        if isinstance(x, (List[str], str, int)):
+      //            ...
+      //
+      // then `x` would be `str` in the true branch and `None` in the
+      // false branch, not `(List[str], str, int)` in the true branch
+      // and `None` in the false branch
+      for (TypePtr lhs_type : lhs_types) {
+        if (lhs_type == AnyType::get()) {
+          isinstance_types.insert(
+              isinstance_types.end(), rhs_types.begin(), rhs_types.end());
+          break;
+        }
+        if (std::any_of(
+                rhs_types.begin(), rhs_types.end(), [&](TypePtr rhs_type) {
+                  return lhs_type->isSubtypeOf(rhs_type);
+                })) {
+          isinstance_types.push_back(lhs_type);
+        } else {
+          not_isinstance_types.push_back(lhs_type);
+        }
+      }
+
+      // Get a single type for the true and false branches
+      unified_true = isinstance_types.empty() ? nullptr
+                                              : *unifyTypeList(
+                                                    isinstance_types,
+                                                    nowhere,
+                                                    /*default_to_union=*/true);
+      if (unified_true) {
+        true_refinements = {Refinement(ident, unified_true)};
+      }
+      unified_false = not_isinstance_types.empty()
+          ? nullptr
+          : *unifyTypeList(
+                not_isinstance_types,
+                nowhere,
+                /*default_to_union=*/true);
+      if (unified_false) {
+        false_refinements = {Refinement(ident, unified_false)};
+      }
+
+      refinement = RefinementSet(true_refinements, false_refinements);
     }
 
-    if (gathered.staticallyTrue(val->type())) {
+    bool is_statically_true =
+        std::all_of(lhs_types.begin(), lhs_types.end(), [&](TypePtr lhs_type) {
+          return std::any_of(
+              rhs_types.begin(), rhs_types.end(), [&](TypePtr rhs_type) {
+                return lhs_type->isSubtypeOf(rhs_type);
+              });
+        });
+
+    bool is_statically_false =
+        std::all_of(lhs_types.begin(), lhs_types.end(), [&](TypePtr lhs_type) {
+          if (lhs_type == AnyType::get()) {
+            return false;
+          }
+          for (const auto rhs_type : rhs_types) {
+            if (lhs_type->isSubtypeOf(rhs_type)) {
+              return false;
+            }
+            if (rhs_type->isSubtypeOf(AnyListType::get()) &&
+                (lhs_type->kind() == ListType::Kind ||
+                 lhs_type->kind() == AnyType::Kind)) {
+              return false;
+            }
+            if (rhs_type->isSubtypeOf(AnyTupleType::get()) &&
+                (lhs_type->kind() == TupleType::Kind ||
+                 lhs_type->kind() == AnyType::Kind)) {
+              return false;
+            }
+          }
+          return true;
+        });
+
+    if (is_statically_true) {
       return CondValue(*graph, obj.range(), true, std::move(refinement));
     }
-    if (gathered.staticallyFalse(val->type())) {
+
+    if (is_statically_false) {
       return CondValue(*graph, obj.range(), false, std::move(refinement));
     }
+
     // check maybe true/false at runtime, need an actual op
     Value* result =
-        graph->insertNode(graph->createIsInstance(val, gathered.types))
+        graph->insertNode(graph->createIsInstance(lhs_val, rhs_types))
             ->output();
     return CondValue(result, std::move(refinement), c10::nullopt);
   }
@@ -2039,6 +2180,7 @@ struct to_ir {
   }
 
   // emit assserions as an if branch so that assertions will reuse the
+  // message
   void emitAssert(const Assert& stmt) {
     CondValue cond_value = emitCondExpr(stmt.test());
     List<Stmt> true_branch = List<Stmt>::create(stmt.range(), {});

@@ -898,6 +898,7 @@ UnionTypePtr UnionType::create(std::vector<TypePtr> types) {
   return UnionTypePtr(std::move(union_type));
 }
 
+
 bool UnionType::operator==(const Type& rhs) const {
   auto can_hold_numbertype = [&]() {
     std::vector<TypePtr> number_types{IntType::get(), FloatType::get(), ComplexType::get()};
@@ -945,8 +946,9 @@ bool UnionType::operator==(const Type& rhs) const {
     }
   } else if (rhs.kind() == NumberType::Kind) {
     return can_hold_numbertype();
+  } else {
+    return false;
   }
-  return false;
 }
 
 
