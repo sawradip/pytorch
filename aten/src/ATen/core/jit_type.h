@@ -93,25 +93,101 @@ struct SingleElementType : public Type {
   TypePtr elem;
 };
 
+struct UnionType;
+using UnionTypePtr = std::shared_ptr<UnionType>;
+struct TORCH_API UnionType : public Type {
+  friend struct Type;
+
+  static const TypeKind Kind = TypeKind::UnionType;
+
+  bool isSubtypeOfExt(const TypePtr& rhs_, std::ostream* why_not) const;
+
+  std::string str() const;
+
+  static UnionTypePtr create(std::vector<TypePtr> types);
+
+  bool operator==(const Type& rhs) const override;
+
+  at::ArrayRef<TypePtr> containedTypes() const override {
+    return types_;
+  }
+
+  TypePtr createWithContained(std::vector<TypePtr> contained_types) const override {
+    return create(contained_types);
+  }
+
+  bool canHoldType(TypePtr type) const;
+
+  bool hasFreeVariables() const override {
+    return has_free_variables_;
+  }
+
+  c10::optional<TypePtr> toOptional() const;
+
+  c10::optional<TypePtr> subtractTypeSet(std::vector<TypePtr>& to_subtract) const;
+
+ protected:
+    UnionType(std::vector<TypePtr> types, TypeKind kind=TypeKind::UnionType);
+    bool has_free_variables_;
+
+ private:
+  std::vector<TypePtr> types_;
+  bool can_hold_none_;
+
+  std::string annotation_str_impl(TypePrinter printer) const {
+    std::stringstream ss;
+    ss << "Union[";
+    for (size_t i = 0; i < types_.size(); ++i) {
+      if (i > 0)
+        ss << ", ";
+      ss << types_[i]->annotation_str(printer);
+    }
+    ss << "]";
+    return ss.str();
+  }
+
+};
+
 struct OptionalType;
 using OptionalTypePtr = std::shared_ptr<OptionalType>;
-// This type represents an optional type, for each element type.
-// Optional[T] can accept both T and None(nullopt in C++)
+// This type represents an optional type. There is one `Optional` for
+// each element type. `Optional[T]` can accept both `T` and
+// `None`(`c10::nullopt` in C++)
 // Subtype hierarchy for Optional:
-// 1. Optional[T] <: Optional[R] iff T <: R
-// 2. T <: Optional[R] if T <: R
-// 3. None <: Optional[T] for all T
-struct TORCH_API OptionalType
-    : public SingleElementType<TypeKind::OptionalType, OptionalType> {
-  static OptionalTypePtr create(TypePtr element) {
-    TORCH_INTERNAL_ASSERT(element, "OptionalType requires valid TypePtr");
-    // Optional is a union of [None, T], so Optional[[Optional[T]]] ->
-    // Optional[T]
-    if (auto opt_ptr = element->cast<OptionalType>()) {
-      return opt_ptr;
+//     - Optional[T] <: Optional[R] iff T <: R
+//     - T <: Optional[R] if T <: R
+//     - None <: Optional[T] for all T
+//     - Optional[T] == Union[T, None] for all T
+struct TORCH_API OptionalType : public UnionType {
+  static OptionalTypePtr create(TypePtr contained) {
+    TORCH_INTERNAL_ASSERT(contained, "OptionalType requires a valid TypePtr");
+    return OptionalTypePtr(new OptionalType(std::move(contained)));
+  }
+
+  static const TypeKind Kind = TypeKind::OptionalType;
+
+  friend struct Type;
+
+  bool operator==(const Type& rhs) const override {
+    if (auto union_rhs = rhs.cast<UnionType>()) {
+      auto optional_rhs = union_rhs->toOptional();
+      if (optional_rhs) {
+        return *this == *((optional_rhs.value())->cast<OptionalType>());
+      }
+      return false;
     }
-    return OptionalTypePtr(
-        new OptionalType(std::move(element))); // NOLINT(modernize-make-shared)
+    if (auto optional_rhs = rhs.cast<OptionalType>()) {
+      return *this->getElementType() == *optional_rhs->getElementType();
+    }
+    return false;
+  }
+
+  TypePtr getElementType() const {
+    return contained_;
+  }
+
+  at::ArrayRef<TypePtr> containedTypes() const override {
+    return contained_;
   }
 
   std::string str() const override {
@@ -126,20 +202,15 @@ struct TORCH_API OptionalType
     return create(contained_types[0]);
   }
 
-  bool isSubtypeOfExt(const TypePtr& rhs, std::ostream* why_not) const override {
-    if (Type::isSubtypeOfExt(rhs, why_not)) {
-      return true;
-    }
-    if (auto rhs_ = rhs->cast<OptionalType>()) {
-      return getElementType()->isSubtypeOfExt(rhs_->getElementType(), why_not);
-    }
-    return false;
-  }
+  bool isSubtypeOfExt(const TypePtr& rhs, std::ostream* why_not) const override;
+
   // common cast Optional[Tensor] for undefined tensor type
   static OptionalTypePtr ofTensor();
 
  private:
-  OptionalType(TypePtr elem) : SingleElementType(elem) {}
+  OptionalType(TypePtr contained);
+
+  TypePtr contained_;
 
   std::string annotation_str_impl(TypePrinter printer = nullptr) const override {
     std::stringstream ss;
@@ -906,7 +977,6 @@ struct TORCH_API RRefType
   }
 };
 
-
 struct NamedType;
 using NamedTypePtr = std::shared_ptr<NamedType>;
 using ConstNamedTypePtr = std::shared_ptr<const NamedType>;
@@ -1103,7 +1173,6 @@ struct TORCH_API EnumType : public NamedType {
   std::weak_ptr<::torch::jit::CompilationUnit> cu_;
 };
 
-
 // the common supertype of all Enums, only used in operator registraion.
 // EnumType <: AnyEnumType for all Enums
 struct AnyEnumType;
@@ -1123,7 +1192,6 @@ private:
   : Type(TypeKind::AnyEnumType) {}
 };
 
-
 struct NumberType;
 using NumberTypePtr = std::shared_ptr<NumberType>;
 // This type represents a Python number
@@ -1132,9 +1200,10 @@ using NumberTypePtr = std::shared_ptr<NumberType>;
 // FloatType <: NumberType
 // ComplexType <:NumberType
 struct TORCH_API NumberType : public Type {
-  bool operator==(const Type& rhs) const override {
-    return rhs.kind() == kind();
-  }
+  bool operator==(const Type& rhs) const override;
+
+  bool isSubtypeOfExt(const TypePtr& rhs, std::ostream* why_not) const override;
+
   std::string str() const override {
     return "Scalar"; // match what PythonArgParser says for clarity
   }
@@ -1163,7 +1232,7 @@ struct TORCH_API FloatType : public NumberType {
     return "float";
   }
   bool isSubtypeOfExt(const TypePtr& rhs, std::ostream* why_not) const override {
-    return rhs->kind() == TypeKind::NumberType || NumberType::isSubtypeOfExt(rhs, why_not);
+    return rhs->kind() == TypeKind::NumberType || Type::isSubtypeOfExt(rhs, why_not);
   }
   static const TypeKind Kind = TypeKind::FloatType;
   // global singleton
@@ -1187,7 +1256,7 @@ struct TORCH_API ComplexType : public NumberType {
     return "complex";
   }
   bool isSubtypeOfExt(const TypePtr& rhs, std::ostream* why_not) const override {
-    return rhs->kind() == TypeKind::NumberType || NumberType::isSubtypeOfExt(rhs, why_not);
+    return rhs->kind() == TypeKind::NumberType || Type::isSubtypeOfExt(rhs, why_not);
   }
   static const TypeKind Kind = TypeKind::ComplexType;
   // global singleton
@@ -1211,7 +1280,7 @@ struct TORCH_API IntType : public NumberType {
     return "int";
   }
   bool isSubtypeOfExt(const TypePtr& rhs, std::ostream* why_not) const override {
-    return rhs->kind() == TypeKind::NumberType || NumberType::isSubtypeOfExt(rhs, why_not);
+    return rhs->kind() == TypeKind::NumberType || Type::isSubtypeOfExt(rhs, why_not);
   }
   static const TypeKind Kind = TypeKind::IntType;
   // global singleton
@@ -1325,12 +1394,8 @@ struct TORCH_API NoneType : public Type {
   std::string str() const override {
     return "NoneType";
   }
-  bool isSubtypeOfExt(const TypePtr& rhs, std::ostream *why_not) const override {
-    if (rhs->kind() == OptionalType::Kind) {
-      return true;
-    }
-    return Type::isSubtypeOfExt(rhs, why_not);
-  }
+  bool isSubtypeOfExt(const TypePtr& rhs, std::ostream *why_not) const override;
+
   static const TypeKind Kind = TypeKind::NoneType;
   // global singleton
   static NoneTypePtr get();
@@ -1561,7 +1626,7 @@ inline at::ScalarType scalarTypeFromJitType(const c10::TypePtr& type) {
 }
 
 // Attempt to find the correct supertype of t1 and t2. If none is found then
-// nullopt will be returned if default_to_any is false, and Any will be returned
+// nullopt will be returned if default_to_union is false, and Any will be returned
 // if it is true. If t1 == t2, or t1 is a type refinement of t2,
 // then t2 will be returned (and vice versa).
 // Two different tensortypes will return dynamic.
@@ -1570,11 +1635,12 @@ inline at::ScalarType scalarTypeFromJitType(const c10::TypePtr& type) {
 TORCH_API c10::optional<TypePtr> unifyTypes(
     const TypePtr& t1,
     const TypePtr& t2,
-    bool default_to_any = false);
+    bool default_to_union=false);
 
 TORCH_API c10::optional<TypePtr> unifyTypeList(
     at::ArrayRef<TypePtr> elements,
-    std::ostream& why_not);
+    std::ostream& why_not,
+    bool default_to_union=false);
 
 namespace detail {
 template <typename T>
